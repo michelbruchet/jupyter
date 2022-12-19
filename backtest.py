@@ -1,3 +1,12 @@
+import pandas as pd
+import yfinance as yf
+import numpy as np
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+plt.style.use('seaborn')
+import matplotlib as mpl
+
+
 def backtest_static_portfolio(weights, database, ben="^GSPC", timeframe=252, CR=False):
     """
     -----------------------------------------------------------------------------
@@ -169,7 +178,7 @@ def backtest_static_portfolio(weights, database, ben="^GSPC", timeframe=252, CR=
         plt.show()
 
 
-def backtest_dynamic_portfolio(portfolio, ben="^GSPC", timeframe=252):
+def backtest_dynamic_portfolio(dfc, ben="^GSPC", timeframe=252):
   """
   -----------------------------------------------------------------------------
   | Output: Beta CAPM metric                                                  |
@@ -196,7 +205,15 @@ def backtest_dynamic_portfolio(portfolio, ben="^GSPC", timeframe=252):
   plt.rc('font', **font)
 
   
-  
+  # CREATE DAILY RETURNS
+  portfolio = dfc["returns"]
+  if portfolio.index.name != "Time":
+      portfolio.index.name = "Time"
+
+
+  portfolio = portfolio.reset_index(drop=False)
+  portfolio.groupby(pd.Grouper(key='Time',freq='d')).sum()
+  portfolio = portfolio.set_index("Time")
   ######################### COMPUTE THE BETA ##################################
   # Importation of benchmark
   benchmark = yf.download(ben)["Adj Close"].pct_change(1).dropna()
@@ -267,7 +284,9 @@ def backtest_dynamic_portfolio(portfolio, ben="^GSPC", timeframe=252):
   ######################### COMPUTE THE cVaR #################################
   cVaR = -vec.sort_values(by="Simulations").iloc[0:t,:].mean().values[0]
 
-  
+  ######################### TIME UNDERWATER ##################################
+  tuw = len(drawdown[drawdown<0]) / len(drawdown)
+
   ######################### PLOT THE RESULTS #################################
   print(f"""
     -----------------------------------------------------------------------------
@@ -298,4 +317,132 @@ def backtest_dynamic_portfolio(portfolio, ben="^GSPC", timeframe=252):
   plt.yticks(size=15,fontweight="bold")
   plt.show()
 
-  
+def backtest_tpsl_portfolio(dfc, ben="^GSPC", timeframe=252):
+
+    """
+    -----------------------------------------------------------------------------
+    | Output: Backtest                                                          |
+    -----------------------------------------------------------------------------
+    | Inputs: - database (type dataframe pandas): data of the asset          |
+    |         - ben (type string): Name of the benchmark                        |
+    |         - timeframe (type int): annualization factor                      |
+    -----------------------------------------------------------------------------
+    """
+    # COMPUTE TRADE LIFETIME
+    sum_dates = dfc["duration"]
+    seconds = np.round(np.mean(list(sum_dates.loc[sum_dates!=0])).total_seconds())
+    minutes = seconds//60
+    minutes_left = int(minutes%60)
+    hours = int(minutes//60)
+
+    # CREATE DAILY RETURNS
+    portfolio = dfc["returns"]
+    if portfolio.index.name != "Time":
+        portfolio.index.name = "Time"
+
+
+    portfolio = portfolio.reset_index(drop=False)
+    portfolio.groupby(pd.Grouper(key='Time',freq='d')).sum()
+    portfolio = portfolio.set_index("Time")
+
+    ######################### COMPUTE THE BETA ##################################
+    # Importation of benchmark
+    benchmark = yf.download(ben)["Adj Close"].pct_change(1).dropna()
+
+    # Concat the asset and the benchmark
+    join = pd.concat((portfolio[["returns"]], benchmark), axis=1).dropna()
+
+    # Covariance between the asset and the benchmark
+    cov = np.cov(join, rowvar=False)[0][1]
+
+    # Compute the variance of the benchmark
+    var = np.cov(join, rowvar=False)[1][1]
+
+    beta = cov/var
+
+    ######################### COMPUTE THE ALPHA #################################
+    # Mean of returns for the asset
+    mean_stock_return = join.iloc[:,0].mean()*timeframe
+
+    # Mean of returns for the market
+    mean_market_return = join.iloc[:,1].mean()*timeframe
+
+    # Alpha
+    alpha = mean_stock_return - beta*mean_market_return
+
+    ######################### COMPUTE THE SHARPE ################################
+    mean = portfolio.mean() * np.sqrt(timeframe)
+    std = portfolio.std() 
+    Sharpe = (mean/std)[0]
+
+
+    ######################### COMPUTE THE SORTINO ###############################
+    downward = portfolio[portfolio<0]* np.sqrt(timeframe)
+    std_downward = downward.std()
+    Sortino = (mean/std_downward)[0]
+
+
+    ######################### COMPUTE THE DRAWDOWN ###############################
+    # Compute the cumulative product returns
+    coef_rets = (portfolio+1).cumprod()
+    cum_rets = coef_rets-1
+
+    # Compute the running max
+    running_max = np.maximum.accumulate(coef_rets.dropna())
+    #running_max[running_max < 1] = 1
+
+    # Compute the drawdown
+    drawdown = ((coef_rets/running_max) - 1)
+    min_drawdon = (-drawdown.min())[0]
+
+    ######################### COMPUTE THE VaR ##################################
+    theta = 0.01
+    # Number of simulations
+    n = 100000
+
+    # Find the values for theta% error threshold
+    t = int(n*theta)
+
+    # Create a vector with n simulations of the normal law
+    vec = pd.DataFrame(np.random.normal(mean, std, size=(n,)),columns = ["Simulations"])
+
+    # Orderer the values and find the theta% value
+    VaR = -vec.sort_values(by="Simulations").iloc[t].values[0]
+
+
+    ######################### COMPUTE THE cVaR #################################
+    cVaR = -vec.sort_values(by="Simulations").iloc[0:t,:].mean().values[0]
+
+    ######################### TIME UNDERWATER ##################################
+    tuw = len(drawdown[drawdown["returns"]<0]) / len(drawdown)
+    
+    ######################### PLOT THE RESULTS #################################
+    print(f"""
+    -----------------------------------------------------------------------------
+    Beta: {np.round(beta, 3)} \t Alpha: {np.round(alpha*100, 2)} %\t \
+    AVERAGE TRADE LIFETIME: {hours}H {minutes_left}min
+    -----------------------------------------------------------------------------
+    VaR: {np.round(VaR*100, 2)} %\t cVaR: {np.round(cVaR*100, 2)} % \t \
+    TUW: {np.round(tuw*100,2)}%  \t drawdown: {np.round(min_drawdon*100, 2)} %
+    -----------------------------------------------------------------------------""")
+
+    plt.figure(figsize=(15,8))
+    plt.plot(cum_rets*100, color="#035593", linewidth=3)
+    plt.plot(join.iloc[:,1].cumsum()*100, color="#068C72", linewidth=3)
+    plt.title("CUMULTATIVE RETURN", size=15)
+    plt.ylabel("Cumulative return %", size=15)
+    plt.xticks(size=15,fontweight="bold")
+    plt.yticks(size=15,fontweight="bold")
+    plt.legend(["Strategy", "Benchmark"])
+    plt.show()
+
+    plt.figure(figsize=(15,8))
+    plt.fill_between(drawdown.index, drawdown.iloc[:,0]*100, 0, color="#CE5151")
+    plt.plot(drawdown.index,drawdown.iloc[:,0]*100, color="#930303", linewidth=3)
+
+
+    plt.title("DRAWDOWN", size=15)
+    plt.ylabel("Drawdown %", size=15)
+    plt.xticks(size=15,fontweight="bold")
+    plt.yticks(size=15,fontweight="bold")
+    plt.show()
